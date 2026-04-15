@@ -9,9 +9,9 @@
     <td><img width="100%" alt="邮件内容展示" src="https://github.com/user-attachments/assets/7d6f766a-cfe0-497c-8a6d-ccd1ea0f4623" /></td>
   </tr>
   <tr>
-    <td align="center">稳定签到成功</td>
-    <td align="center">多轮失败重试</td>
-    <td align="center">邮件内容展示</td>
+    <td align="center">（a）稳定签到成功</td>
+    <td align="center">（b）多轮失败重试</td>
+    <td align="center">（c）邮件内容展示</td>
   </tr>
 </table>
 

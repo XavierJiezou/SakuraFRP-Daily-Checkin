@@ -7,6 +7,7 @@ account.txt
 
 # 登录状态缓存（包含cookies）
 state.json
+alert_state.json
 
 # ========== 运行时生成的文件 ==========
 # 签到截图

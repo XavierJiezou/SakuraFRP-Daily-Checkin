@@ -1,0 +1,118 @@
+name: SakuraFRP Daily Check-in
+
+on:
+  schedule:
+    # 12:00 Asia/Shanghai == 04:00 UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sakurafrp-daily-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Prepare Runtime Config
+        shell: bash
+        run: |
+          cat > account.txt <<EOF
+          ${{ secrets.SAKURA_USERNAME }}
+          ${{ secrets.SAKURA_PASSWORD }}
+          EOF
+
+          cat > .env <<EOF
+          ZHIPU_API_KEY=${{ secrets.ZHIPU_API_KEY }}
+          ZHIPU_MODEL_VISION=glm-4v-flash
+          ZHIPU_MODEL_TEXT=glm-4-flash
+          SCHEDULE_TIME=12:00
+          HTTP_PROXY=${{ secrets.HTTP_PROXY }}
+          USE_STATE_CACHE=false
+          EMAIL_NOTIFY_ENABLED=true
+          EMAIL_SMTP_HOST=smtp.qq.com
+          EMAIL_SMTP_USER=${{ secrets.EMAIL_SMTP_USER }}
+          EMAIL_SMTP_PASSWORD=${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_TO=${{ secrets.EMAIL_TO }}
+          FAIL_ALERT_ENABLED=true
+          FAIL_ALERT_THRESHOLD=2
+          CAPTCHA_EXTRA_ROUND_ENABLED=true
+          CAPTCHA_EXTRA_ROUND_ATTEMPTS=2
+          CHECKIN_MAX_RETRIES=5
+          CHECKIN_RETRY_INTERVAL_SECONDS=30
+          EOF
+
+      - name: Run Check-in With Retries
+        shell: bash
+        run: |
+          set -e
+          max_retries=5
+          interval=30
+          attempt=1
+          success=0
+
+          while [ "$attempt" -le "$max_retries" ]; do
+            echo "[INFO] Attempt ${attempt}/${max_retries}"
+
+            if [ "$attempt" -lt "$max_retries" ]; then
+              export SUPPRESS_FAIL_EMAIL=true
+            else
+              export SUPPRESS_FAIL_EMAIL=false
+            fi
+
+            export CHECKIN_CURRENT_ATTEMPT="$attempt"
+            export CHECKIN_TOTAL_ATTEMPTS="$max_retries"
+
+            if python main.py --both; then
+              success=1
+              echo "[INFO] Check-in succeeded on attempt ${attempt}"
+              break
+            fi
+
+            echo "[WARNING] Attempt ${attempt} failed"
+            if [ "$attempt" -lt "$max_retries" ]; then
+              sleep "$interval"
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          if [ "$success" -ne 1 ]; then
+            echo "[ERROR] All attempts failed"
+            exit 1
+          fi
+
+      - name: Upload Logs and Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-artifacts-${{ github.run_id }}
+          retention-days: 7
+          path: |
+            logs/
+            checkin.png
+            before_click.png
+            after_click.png
+            slider_before_drag.png
+            slider_after_drag.png
+            captcha_bg.png
+            captcha_slice.png
+            captcha_full.png

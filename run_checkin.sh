@@ -19,6 +19,12 @@ else
     exit 1
 fi
 
+# 兼容部分Linux环境缺少系统音频库（如libasound.so.2）
+# 若用户安装了conda，则优先补充其lib目录到动态库搜索路径
+if [ -n "${HOME:-}" ] && [ -f "$HOME/miniconda3/lib/libasound.so.2" ]; then
+    export LD_LIBRARY_PATH="$HOME/miniconda3/lib:${LD_LIBRARY_PATH:-}"
+fi
+
 # 获取当前日期（YYYY-MM-DD格式）
 CURRENT_DATE=$(date +%Y-%m-%d)
 
@@ -84,31 +90,69 @@ if [ "$CURRENT_HOUR" = "$RANDOM_HOUR" ] && [ "$CURRENT_MIN" = "$RANDOM_MIN" ]; t
     CURRENT_TIME_FULL=$(date +%H:%M:%S)
     echo "[INFO] 当前时间 $CURRENT_TIME_FULL，匹配随机时间 $RANDOM_TIME，开始执行签到脚本..."
     
-    # 执行Python脚本
-    # 优先使用uv虚拟环境，如果存在
-    if [ -d ".venv" ] && [ -f ".venv/bin/python" ]; then
-        echo "[INFO] 使用uv虚拟环境执行脚本"
-        .venv/bin/python main.py --both
-    elif command -v uv &> /dev/null; then
-        echo "[INFO] 使用uv run执行脚本"
-        uv run main.py --both
-    elif command -v python3 &> /dev/null; then
-        echo "[INFO] 使用python3执行脚本"
-        python3 main.py --both
-    elif command -v python &> /dev/null; then
-        echo "[INFO] 使用python执行脚本"
-        python main.py --both
-    else
-        echo "[ERROR] 未找到Python解释器"
-        rm -f "$LOCK_FILE"
-        exit 1
+    # 脚本级多轮重试（与 main.py 内部验证码重试配合）
+    MAX_RETRIES=${CHECKIN_MAX_RETRIES:-5}
+    RETRY_INTERVAL=${CHECKIN_RETRY_INTERVAL_SECONDS:-30}
+    if ! [[ "$MAX_RETRIES" =~ ^[0-9]+$ ]] || [ "$MAX_RETRIES" -lt 1 ]; then
+        MAX_RETRIES=5
     fi
-    
-    EXIT_CODE=$?
+    if ! [[ "$RETRY_INTERVAL" =~ ^[0-9]+$ ]] || [ "$RETRY_INTERVAL" -lt 1 ]; then
+        RETRY_INTERVAL=30
+    fi
+
+    EXIT_CODE=1
+    ATTEMPT=1
+    while [ "$ATTEMPT" -le "$MAX_RETRIES" ]; do
+        export CHECKIN_CURRENT_ATTEMPT="$ATTEMPT"
+        export CHECKIN_TOTAL_ATTEMPTS="$MAX_RETRIES"
+
+        if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
+            export SUPPRESS_FAIL_EMAIL=true
+        else
+            export SUPPRESS_FAIL_EMAIL=false
+        fi
+
+        echo "[INFO] 开始第 ${ATTEMPT}/${MAX_RETRIES} 轮签到尝试..."
+
+        # 执行Python脚本
+        # 优先使用uv虚拟环境，如果存在
+        if [ -d ".venv" ] && [ -f ".venv/bin/python" ]; then
+            echo "[INFO] 使用uv虚拟环境执行脚本"
+            .venv/bin/python main.py --both
+        elif command -v uv &> /dev/null; then
+            echo "[INFO] 使用uv run执行脚本"
+            uv run main.py --both
+        elif command -v python3 &> /dev/null; then
+            echo "[INFO] 使用python3执行脚本"
+            python3 main.py --both
+        elif command -v python &> /dev/null; then
+            echo "[INFO] 使用python执行脚本"
+            python main.py --both
+        else
+            echo "[ERROR] 未找到Python解释器"
+            rm -f "$LOCK_FILE"
+            exit 1
+        fi
+
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 0 ]; then
+            echo "[INFO] 第 ${ATTEMPT}/${MAX_RETRIES} 轮签到成功"
+            break
+        fi
+
+        echo "[WARNING] 第 ${ATTEMPT}/${MAX_RETRIES} 轮签到失败，退出码: $EXIT_CODE"
+        if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
+            echo "[INFO] ${RETRY_INTERVAL} 秒后重试..."
+            sleep "$RETRY_INTERVAL"
+        fi
+
+        ATTEMPT=$((ATTEMPT + 1))
+    done
+
     if [ $EXIT_CODE -eq 0 ]; then
         echo "[INFO] 签到脚本执行完成"
     else
-        echo "[ERROR] 签到脚本执行失败，退出码: $EXIT_CODE"
+        echo "[ERROR] 签到脚本执行失败（已重试 ${MAX_RETRIES} 轮），退出码: $EXIT_CODE"
         # 执行失败时删除锁文件，允许重试
         rm -f "$LOCK_FILE"
     fi

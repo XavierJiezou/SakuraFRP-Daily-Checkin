@@ -4,15 +4,21 @@ import io
 import time
 import random
 import re
+import json
 import argparse
 import traceback
+import socket
 from pathlib import Path
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from PIL import Image
 from playwright.sync_api import sync_playwright
 from ai_service import AIService
 from logger import CheckinLogger
 import pytweening  # 用于缓动函数（无GUI依赖）
+
+# 加载环境变量
+load_dotenv()
 
 # 强制 Windows 终端使用 UTF-8 编码
 if sys.platform == 'win32':
@@ -26,6 +32,7 @@ target_url = f"https://{domain}/user/"
 ACCOUNT_FILE = BASE_DIR / "account.txt"  
 STATE_FILE = BASE_DIR / "state.json"     
 SUCCESS_SCREENSHOT = BASE_DIR / "checkin.png"
+ALERT_STATE_FILE = BASE_DIR / "alert_state.json"
 
 ALREADY_SIGNED_TEXT = "今天已经签到过啦"       
 SIGNED_ANCESTOR_LEVELS = 3                
@@ -76,6 +83,325 @@ def clean_old_logs(base_dir: Path, days: int = 30):
     
     if deleted_count > 0:
         print(f"[INFO] 清理完成，共删除 {deleted_count} 个30天前的日志文件")
+
+def parse_traffic_to_bytes(value_text: str):
+    """将流量字符串（如 1.23 GB / 512MB）转换为字节数"""
+    if not value_text:
+        return None
+
+    text = value_text.strip().replace(" ", "")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|KIB|MIB|GIB|TIB)", text, re.IGNORECASE)
+    if not match:
+        return None
+
+    num = float(match.group(1))
+    unit = match.group(2).upper()
+    multipliers = {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024 ** 2,
+        "GB": 1024 ** 3,
+        "TB": 1024 ** 4,
+        "KIB": 1024,
+        "MIB": 1024 ** 2,
+        "GIB": 1024 ** 3,
+        "TIB": 1024 ** 4,
+    }
+    return int(num * multipliers.get(unit, 1))
+
+def format_traffic(bytes_value):
+    """将字节数格式化为可读流量字符串"""
+    if bytes_value is None:
+        return "未知"
+
+    value = float(bytes_value)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    return f"{value:.2f} {units[unit_index]}"
+
+def get_remaining_traffic_bytes(page, logger=None):
+    """从页面文本中提取“剩余/可用/当前”流量值（字节）"""
+    body_text = ""
+    for _ in range(6):
+        try:
+            body_text = page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            body_text = ""
+
+        # 方案1：整页直接匹配“可用/剩余/当前流量 + 数值单位”
+        direct_match = re.search(
+            r"(?:可用|剩余|当前)\s*流量[^\d]{0,20}(\d+(?:\.\d+)?\s*(?:B|KB|MB|GB|TB|KiB|MiB|GiB|TiB))",
+            body_text,
+            re.IGNORECASE,
+        )
+        if direct_match:
+            bytes_value = parse_traffic_to_bytes(direct_match.group(1))
+            if bytes_value is not None:
+                if logger:
+                    logger.log_debug(f"直接匹配到剩余流量: {direct_match.group(0)}")
+                return bytes_value
+
+        # 方案2：按行兜底解析
+        lines = [line.strip() for line in body_text.splitlines() if line.strip()]
+        for line in lines:
+            if "流量" in line and ("剩余" in line or "可用" in line or "当前" in line):
+                bytes_value = parse_traffic_to_bytes(line)
+                if bytes_value is not None:
+                    if logger:
+                        logger.log_debug(f"按行解析到剩余流量: {line}")
+                    return bytes_value
+
+        page.wait_for_timeout(1000)
+
+    return None
+
+def get_reward_traffic_bytes_from_page(page, logger=None):
+    """尝试从页面文本中提取本次签到奖励流量"""
+    try:
+        body_text = page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        return None
+
+    reward_patterns = [
+        r"(?:获得|奖励|增加|领取)[^\n]{0,30}?(\d+(?:\.\d+)?\s*(?:B|KB|MB|GB|TB|KiB|MiB|GiB|TiB))",
+        r"(\d+(?:\.\d+)?\s*(?:B|KB|MB|GB|TB|KiB|MiB|GiB|TiB))[^\n]{0,20}?(?:流量)",
+    ]
+
+    for pattern in reward_patterns:
+        match = re.search(pattern, body_text, re.IGNORECASE)
+        if match:
+            bytes_value = parse_traffic_to_bytes(match.group(1))
+            if bytes_value is not None:
+                if logger:
+                    logger.log_debug(f"解析到奖励流量文本: {match.group(0)}")
+                return bytes_value
+    return None
+
+def get_local_ip():
+    """获取本机对外出口IP（局域网IP）"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            return ip
+        finally:
+            sock.close()
+    except Exception:
+        return "unknown"
+
+def send_email_notification(subject, contents, logger=None):
+    """发送邮件通知的通用函数"""
+    enabled = os.getenv("EMAIL_NOTIFY_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return False
+
+    smtp_user = os.getenv("EMAIL_SMTP_USER", "").strip()
+    smtp_password = os.getenv("EMAIL_SMTP_PASSWORD", "").strip()
+    smtp_host = os.getenv("EMAIL_SMTP_HOST", "smtp.qq.com").strip() or "smtp.qq.com"
+    to_raw = os.getenv("EMAIL_TO", smtp_user).strip()
+    to_list = [x.strip() for x in to_raw.split(",") if x.strip()]
+
+    if not smtp_user or not smtp_password or not to_list:
+        msg = "邮件通知已启用，但 SMTP 配置不完整（EMAIL_SMTP_USER / EMAIL_SMTP_PASSWORD / EMAIL_TO）"
+        print(f"[WARNING] {msg}")
+        if logger:
+            logger.log_error(msg)
+        return False
+
+    try:
+        import yagmail
+        yagmail.SMTP(
+            user=smtp_user,
+            password=smtp_password,
+            host=smtp_host,
+        ).send(
+            to=to_list,
+            subject=subject,
+            contents=contents,
+        )
+        print(f"[INFO] 邮件通知已发送: {', '.join(to_list)}")
+        if logger:
+            logger.log_info(f"邮件通知已发送: {', '.join(to_list)}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] 邮件发送失败: {e}")
+        if logger:
+            logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
+        return False
+
+def load_alert_state():
+    """读取连续失败告警状态"""
+    default_state = {"consecutive_failures": 0, "last_alerted_failures": 0}
+    try:
+        if ALERT_STATE_FILE.exists():
+            data = json.loads(ALERT_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {
+                    "consecutive_failures": int(data.get("consecutive_failures", 0)),
+                    "last_alerted_failures": int(data.get("last_alerted_failures", 0)),
+                }
+    except Exception:
+        pass
+    return default_state
+
+def save_alert_state(state):
+    """保存连续失败告警状态"""
+    try:
+        ALERT_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def update_failure_alert_state(success, reason="", logger=None):
+    """更新连续失败计数并在达到阈值时发送告警邮件"""
+    alert_enabled = os.getenv("FAIL_ALERT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    threshold_str = os.getenv("FAIL_ALERT_THRESHOLD", "2").strip()
+    try:
+        threshold = max(1, int(threshold_str))
+    except Exception:
+        threshold = 2
+
+    state = load_alert_state()
+
+    if success:
+        if state.get("consecutive_failures", 0) > 0 and logger:
+            logger.log_info(f"连续失败计数已清零（原值: {state.get('consecutive_failures', 0)}）")
+        state["consecutive_failures"] = 0
+        state["last_alerted_failures"] = 0
+        save_alert_state(state)
+        return
+
+    state["consecutive_failures"] = int(state.get("consecutive_failures", 0)) + 1
+    current_failures = state["consecutive_failures"]
+    save_alert_state(state)
+
+    if logger:
+        logger.log_error(f"本次运行失败，连续失败次数: {current_failures}")
+
+    should_alert = (
+        alert_enabled
+        and current_failures >= threshold
+        and current_failures > int(state.get("last_alerted_failures", 0))
+    )
+
+    if not should_alert:
+        return
+
+    subject = f"[告警] SakuraFRP 连续失败 {current_failures} 次 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    contents = (
+        f"SakuraFRP 自动签到连续失败告警。\n\n"
+        f"连续失败次数：{current_failures}\n"
+        f"告警阈值：{threshold}\n"
+        f"失败原因：{reason or '未知'}\n"
+        f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"主机：{os.uname().nodename if hasattr(os, 'uname') else 'unknown'}\n"
+        f"IP：{get_local_ip()}\n"
+        f"日志目录：{BASE_DIR / 'logs'}"
+    )
+
+    if send_email_notification(subject, contents, logger=logger):
+        state["last_alerted_failures"] = current_failures
+        save_alert_state(state)
+
+def goto_with_retry(page, url, logger=None, attempts=3):
+    """访问页面并在超时时自动重试，降低网络抖动影响"""
+    # 先用 domcontentloaded，最后一次再尝试 load
+    wait_sequence = ["domcontentloaded", "domcontentloaded", "load"]
+    last_error = None
+
+    for i in range(attempts):
+        wait_until = wait_sequence[i] if i < len(wait_sequence) else "load"
+        timeout_ms = 45000 if i < attempts - 1 else 60000
+        try:
+            if logger:
+                logger.log_debug(f"页面访问尝试 {i + 1}/{attempts}, wait_until={wait_until}, timeout={timeout_ms}ms")
+            page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+            return True
+        except Exception as e:
+            last_error = e
+            print(f"[WARNING] 第 {i + 1}/{attempts} 次访问失败: {e}")
+            if logger:
+                logger.log_error(f"第 {i + 1}/{attempts} 次访问失败: {e}")
+            if i < attempts - 1:
+                time.sleep(2)
+
+    if last_error:
+        raise last_error
+    return False
+
+def capture_locator_screenshot(locator, logger=None, name="元素", attempts=3, timeout_ms=8000):
+    """稳定截图：短超时 + 重试，避免偶发字体加载卡住导致整体失败"""
+    last_error = None
+    for i in range(attempts):
+        try:
+            return locator.screenshot(timeout=timeout_ms)
+        except Exception as e:
+            last_error = e
+            if logger:
+                logger.log_debug(f"{name}截图失败 {i + 1}/{attempts}: {e}")
+            time.sleep(0.8)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"{name}截图失败")
+
+def send_success_email(
+    logger=None,
+    before_traffic_bytes=None,
+    reward_traffic_bytes=None,
+    after_traffic_bytes=None,
+    account_name="unknown",
+):
+    """签到成功（含已签到）后发送邮件通知"""
+    subject = f"SakuraFRP 签到成功通知 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    before_text = format_traffic(before_traffic_bytes)
+    reward_text = format_traffic(reward_traffic_bytes)
+    after_text = format_traffic(after_traffic_bytes)
+    host_name = os.uname().nodename if hasattr(os, "uname") else "unknown"
+    local_ip = get_local_ip()
+    log_file_path = str(logger.log_file) if logger and getattr(logger, "log_file", None) else str(BASE_DIR / "logs")
+    contents = (
+        f"签到任务执行成功（包括“今日已签到”状态）。\n\n"
+        f"账号：{account_name}\n"
+        f"签到前剩余流量：{before_text}\n"
+        f"本次签到获得流量：{reward_text}\n"
+        f"签到后剩余流量：{after_text}\n\n"
+        f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"主机：{host_name}\n"
+        f"IP：{local_ip}\n"
+        f"日志文件：{log_file_path}"
+    )
+
+    send_email_notification(subject, contents, logger=logger)
+
+def send_failure_email(reason, logger=None, account_name="unknown"):
+    """最终失败后发送邮件通知"""
+    subject = f"[失败] SakuraFRP 签到失败通知 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    host_name = os.uname().nodename if hasattr(os, "uname") else "unknown"
+    local_ip = get_local_ip()
+    log_file_path = str(logger.log_file) if logger and getattr(logger, "log_file", None) else str(BASE_DIR / "logs")
+
+    current_attempt = os.getenv("CHECKIN_CURRENT_ATTEMPT", "")
+    total_attempts = os.getenv("CHECKIN_TOTAL_ATTEMPTS", "")
+    attempt_text = ""
+    if current_attempt and total_attempts:
+        attempt_text = f"重试轮次：{current_attempt}/{total_attempts}\n"
+
+    contents = (
+        f"SakuraFRP 自动签到最终失败。\n\n"
+        f"账号：{account_name}\n"
+        f"失败原因：{reason or '未知'}\n"
+        f"{attempt_text}"
+        f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"主机：{host_name}\n"
+        f"IP：{local_ip}\n"
+        f"日志文件：{log_file_path}"
+    )
+
+    send_email_notification(subject, contents, logger=logger)
 
 # ---------------- 使用专业库识别缺口 ----------------
 def identify_gap_with_library(bg_img_bytes, logger=None):
@@ -306,7 +632,8 @@ def solve_geetest_multistep(page, ai_service, logger=None):
         if logger:
             logger.log_captcha_step("步骤1", "检测到图片提示，使用AI识别")
         try:
-            target_object = ai_service.call_vision(tip_img.screenshot(), "图中是什么物体？只回答物体名称，不要带标点。")
+            tip_img_bytes = capture_locator_screenshot(tip_img, logger=logger, name="题目提示图")
+            target_object = ai_service.call_vision(tip_img_bytes, "图中是什么物体？只回答物体名称，不要带标点。")
             print(f"[DEBUG] AI识别结果（原始）: {target_object}")
         except Exception as e:
             print(f"[ERROR] AI识别图片提示失败: {e}")
@@ -349,7 +676,7 @@ def solve_geetest_multistep(page, ai_service, logger=None):
     all_descriptions = []
     try:
         # 获取整个九宫格的截图并在内存中处理
-        grid_bytes = img_container.screenshot()
+        grid_bytes = capture_locator_screenshot(img_container, logger=logger, name="九宫格")
         grid_img = Image.open(io.BytesIO(grid_bytes))
         w, h = grid_img.size
         row_h = h / 3
@@ -962,12 +1289,91 @@ def find_signed_text_locator(page, timeout=3000):
     try:
         loc = page.get_by_text(ALREADY_SIGNED_TEXT).first
         if loc.is_visible(timeout=timeout):
+            # 防止误判：如果“点击这里签到”按钮可见，则应视为未签到
+            try:
+                sign_btn = page.get_by_text("点击这里签到").first
+                if sign_btn.is_visible(timeout=500):
+                    return None
+            except:
+                pass
             return loc
     except: 
         pass
     return None
 
+def is_sign_button_visible(page, timeout=1000):
+    """检查签到按钮是否可见"""
+    try:
+        return page.get_by_text("点击这里签到").first.is_visible(timeout=timeout)
+    except Exception:
+        return False
+
+def is_checkin_completed(page, logger=None):
+    """更稳妥的签到完成判定"""
+    current_url = ""
+    try:
+        current_url = page.url
+    except Exception:
+        current_url = ""
+
+    # 登录页或非用户页一律视为未完成
+    if "login" in current_url or "/user" not in current_url:
+        if logger:
+            logger.log_debug(f"签到完成复核 - 非用户页或登录页: {current_url}")
+        return False
+
+    # 1) 明确文案命中
+    if find_signed_text_locator(page, timeout=800):
+        return True
+
+    # 2) 成功关键词（例如签到成功提示/奖励提示）
+    try:
+        body_text = page.locator("body").inner_text(timeout=1000)
+    except Exception:
+        body_text = ""
+
+    # 必须是明确成功关键词，避免公告等文本误触发
+    success_keywords = ["签到成功", "今天已经签到过啦"]
+    has_success_kw = any(k in body_text for k in success_keywords)
+
+    # 奖励文案需带流量单位才视为成功
+    reward_match = re.search(r"获得\s*\d+(?:\.\d+)?\s*(?:GiB|GB|MiB|MB|TiB|TB)", body_text, re.IGNORECASE)
+    has_reward_kw = reward_match is not None
+
+    # 3) 签到按钮不可见 且 验证码弹层已消失
+    sign_button_visible = is_sign_button_visible(page, timeout=500)
+    captcha_visible = False
+    try:
+        captcha_visible = page.locator(".geetest_table_box").first.is_visible(timeout=500)
+    except Exception:
+        captcha_visible = False
+
+    if logger:
+        logger.log_debug(
+            f"签到完成复核 - has_success_kw={has_success_kw}, has_reward_kw={has_reward_kw}, "
+            f"sign_button_visible={sign_button_visible}, captcha_visible={captcha_visible}"
+        )
+
+    return has_success_kw or has_reward_kw
+
+def dismiss_adult_popup(page, logger=None):
+    """关闭18岁确认弹窗（若存在）"""
+    try:
+        btn_18 = page.get_by_text("是，我已满18岁")
+        if btn_18.is_visible(timeout=1500):
+            btn_18.click()
+            page.wait_for_timeout(600)
+            if logger:
+                logger.log_debug("18岁弹窗已关闭")
+            return True
+    except Exception:
+        pass
+    return False
+
 def main():
+    run_success = False
+    failure_reason = "未知错误"
+
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='SakuraFRP自动签到脚本')
     parser.add_argument('--screenshot-only', action='store_true', help='仅记录截图，不记录日志')
@@ -1004,7 +1410,8 @@ def main():
         print(f"[ERROR] {error_msg}")
         if logger:
             logger.log_error(error_msg)
-        return
+        update_failure_alert_state(False, error_msg, logger)
+        return 1
     
     # 加载账号信息
     try:
@@ -1014,9 +1421,13 @@ def main():
         print(f"[ERROR] {error_msg}")
         if logger:
             logger.log_error(error_msg)
-        return
+        update_failure_alert_state(False, error_msg, logger)
+        return 1
 
     with sync_playwright() as p:
+        # 默认不复用 state.json，避免历史会话导致账号或签到状态错读
+        use_state_cache = os.getenv("USE_STATE_CACHE", "false").strip().lower() in ("1", "true", "yes", "on")
+
         # 从环境变量读取代理配置（可选）
         proxy_url = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
         
@@ -1031,7 +1442,23 @@ def main():
             )
         else:
             browser = p.chromium.launch(headless=True, slow_mo=100)
-        context = browser.new_context(storage_state=STATE_FILE if STATE_FILE.exists() else None)
+        context = browser.new_context(storage_state=STATE_FILE if (use_state_cache and STATE_FILE.exists()) else None)
+
+        # 屏蔽字体资源，减少 screenshot 等待字体加载导致的超时
+        def _route_handler(route):
+            try:
+                if route.request.resource_type == "font":
+                    route.abort()
+                else:
+                    route.continue_()
+            except Exception:
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+
+        context.route("**/*", _route_handler)
+
         page = context.new_page()
         page.set_viewport_size({"width": 1280, "height": 900})
         
@@ -1040,7 +1467,7 @@ def main():
             logger.log_info(f"正在访问: {target_url}")
         
         try:
-            page.goto(target_url, timeout=30000)
+            goto_with_retry(page, target_url, logger=logger, attempts=3)
             current_url = page.url
             print(f"[DEBUG] 页面加载完成，当前URL: {current_url}")
             if logger:
@@ -1050,8 +1477,9 @@ def main():
             print(f"[ERROR] {error_msg}")
             if logger:
                 logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
+            update_failure_alert_state(False, error_msg, logger)
             browser.close()
-            return
+            return 1
 
         # 登录判断
         current_url_after_load = page.url
@@ -1087,7 +1515,8 @@ def main():
                 
                 try:
                     page.wait_for_selector("text=账号信息", timeout=10000)
-                    context.storage_state(path=STATE_FILE)
+                    if use_state_cache:
+                        context.storage_state(path=STATE_FILE)
                     is_logged_in = True
                     print("[SUCCESS] 登录成功")
                     if logger:
@@ -1113,25 +1542,69 @@ def main():
 
         # 18岁弹窗
         try:
-            btn_18 = page.get_by_text("是，我已满18岁")
-            if btn_18.is_visible(timeout=3000): 
+            if dismiss_adult_popup(page, logger):
                 print("[DEBUG] 检测到18岁确认弹窗，正在点击...")
-                if logger:
-                    logger.log_debug("检测到18岁确认弹窗，正在点击...")
-                btn_18.click()
-                time.sleep(1)
         except Exception as e:
             if logger:
                 logger.log_debug(f"18岁弹窗处理: {e}")
             pass
 
+        # 登录状态二次确认（防止页面延迟跳转到登录页）
+        try:
+            current_url_recheck = page.url
+        except Exception:
+            current_url_recheck = ""
+
+        username_input_visible_recheck = False
+        try:
+            username_input_visible_recheck = page.locator("#username").is_visible(timeout=1500)
+        except Exception:
+            username_input_visible_recheck = False
+
+        if "login" in current_url_recheck or username_input_visible_recheck:
+            print("[WARNING] 检测到会话跳转至登录页，执行二次登录...")
+            if logger:
+                logger.log_info("检测到会话跳转至登录页，执行二次登录")
+
+            try:
+                page.fill("#username", username)
+                page.fill("#password", password)
+                page.click("#login")
+                page.wait_for_selector("text=账号信息", timeout=15000)
+                if use_state_cache:
+                    context.storage_state(path=STATE_FILE)
+                print("[SUCCESS] 二次登录成功")
+                if logger:
+                    logger.log_info("二次登录成功")
+            except Exception as e:
+                error_msg = f"二次登录失败: {e}"
+                print(f"[ERROR] {error_msg}")
+                if logger:
+                    logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
+                update_failure_alert_state(False, error_msg, logger)
+                browser.close()
+                return 1
+
         # 签到
+        before_traffic_bytes = get_remaining_traffic_bytes(page, logger)
+        if before_traffic_bytes is not None:
+            print(f"[INFO] 签到前剩余流量: {format_traffic(before_traffic_bytes)}")
+            if logger:
+                logger.log_info(f"签到前剩余流量: {format_traffic(before_traffic_bytes)}")
+
+        reward_traffic_bytes = None
+        after_traffic_bytes = None
+        was_already_signed = False
+        pending_failure_reason = None
+
         print("[DEBUG] 开始检查签到状态...")
         if logger:
             logger.log_debug("开始检查签到状态...")
         
+        sign_success = False
         signed_locator = find_signed_text_locator(page)
         if signed_locator:
+            was_already_signed = True
             print("[INFO] 今日已签到。")
             if logger:
                 logger.log_already_signed()
@@ -1158,8 +1631,11 @@ def main():
                 
                 # 初始化签到成功标志
                 sign_success = False
+                captcha_appeared = False
                 
                 try:
+                    # 二次登录后弹层可能重新出现，点击前再清理一次
+                    dismiss_adult_popup(page, logger)
                     sign_btn.click()
                     print("[DEBUG] 已点击签到按钮，等待验证码加载...")
                     if logger:
@@ -1179,7 +1655,6 @@ def main():
                     
                     # 第一次等待：等待15秒后进行第一次检查
                     print("[INFO] 等待15秒让验证码完全加载...")
-                    captcha_appeared = False
                     for i in range(30):  # 30次，每次0.5秒，总共15秒
                         time.sleep(0.5)
                         
@@ -1192,6 +1667,7 @@ def main():
                         if signed_check:
                             print(f"[SUCCESS] 签到完成（无需验证码，等待了 {(i+1)*0.5:.1f} 秒）！")
                             sign_success = True
+                            reward_traffic_bytes = get_reward_traffic_bytes_from_page(page, logger)
                             if logger:
                                 logger.log_sign_success()
                             break
@@ -1215,6 +1691,7 @@ def main():
                                 if signed_check:
                                     print(f"[SUCCESS] 签到完成（无需验证码）！")
                                     sign_success = True
+                                    reward_traffic_bytes = get_reward_traffic_bytes_from_page(page, logger)
                                     if logger:
                                         logger.log_sign_success()
                                     break
@@ -1247,6 +1724,25 @@ def main():
                 except Exception as e:
                     error_msg = f"点击签到按钮失败: {e}"
                     print(f"[ERROR] {error_msg}")
+                    # 若被18岁弹层拦截，尝试关闭弹层并重试一次点击
+                    retried = False
+                    try:
+                        if "adult-check" in str(e) or "intercepts pointer events" in str(e):
+                            dismiss_adult_popup(page, logger)
+                            sign_btn.click(timeout=8000)
+                            retried = True
+                            print("[INFO] 关闭18岁弹层后重试点击签到成功")
+                    except Exception:
+                        retried = False
+
+                    if retried:
+                        try:
+                            time.sleep(1)
+                            captcha_type_check = detect_captcha_type(page, logger)
+                            captcha_appeared = captcha_type_check != "unknown"
+                        except Exception:
+                            pass
+
                     if logger:
                         logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
                 
@@ -1254,26 +1750,47 @@ def main():
                 if not sign_success:
                     # 如果检测到验证码，进入处理流程；否则再尝试检查
                     if captcha_appeared:
-                        max_attempts = 3
+                        base_attempts = 3
                         print("[DEBUG] 验证码已出现，开始处理...")
                     else:
                         # 30秒后仍未检测到验证码，再给最后2次机会（每次2秒）
-                        max_attempts = 2
+                        base_attempts = 2
                         print("[DEBUG] 验证码未出现，再尝试检测2次...")
+
+                    # 额外重试轮（默认开启，仅在验证码场景生效）
+                    extra_attempts = 0
+                    if captcha_appeared:
+                        extra_enabled = os.getenv("CAPTCHA_EXTRA_ROUND_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+                        if extra_enabled:
+                            try:
+                                extra_attempts = max(0, int(os.getenv("CAPTCHA_EXTRA_ROUND_ATTEMPTS", "2").strip()))
+                            except Exception:
+                                extra_attempts = 2
+
+                    max_attempts = base_attempts + extra_attempts
+
                     print(f"[DEBUG] 开始签到循环检测，最多尝试 {max_attempts} 次...")
                     if logger:
                         logger.log_debug(f"开始签到循环检测，最多尝试 {max_attempts} 次...")
+                        if extra_attempts > 0:
+                            logger.log_debug(f"已启用验证码额外重试轮: +{extra_attempts} 次")
                     
                     for attempt in range(1, max_attempts + 1):
+                        if extra_attempts > 0 and attempt == base_attempts + 1:
+                            print(f"[DEBUG] 进入额外重试轮（共 {extra_attempts} 次）...")
+                            if logger:
+                                logger.log_debug(f"进入额外重试轮（共 {extra_attempts} 次）")
+
                         print(f"[DEBUG] 第 {attempt}/{max_attempts} 次检查...")
                         if logger:
                             logger.log_debug(f"第 {attempt}/{max_attempts} 次检查...")
                         
                         # 检查是否已签到成功
                         signed_check = find_signed_text_locator(page, timeout=1000)
-                        if signed_check:
+                        if signed_check or is_checkin_completed(page, logger):
                             print("[SUCCESS] 签到完成！")
                             sign_success = True
+                            reward_traffic_bytes = get_reward_traffic_bytes_from_page(page, logger)
                             if logger:
                                 logger.log_sign_success()
                                 logger.log_debug(f"在第 {attempt} 次检查时检测到签到成功")
@@ -1330,21 +1847,10 @@ def main():
                     if not sign_success:
                         final_url = page.url
                         error_msg = f"签到失败：超时或验证码处理失败（已尝试 {max_attempts} 次）"
-                        print(f"[ERROR] {error_msg}")
-                        print(f"[DEBUG] 最终URL: {final_url}")
+                        pending_failure_reason = error_msg
                         if logger:
-                            logger.log_sign_failed(error_msg)
                             logger.log_wait_timeout("签到循环", max_attempts, max_attempts)
                             logger.log_page_url(final_url)
-                            
-                            # 检查最终状态
-                            final_signed = find_signed_text_locator(page, timeout=1000)
-                            final_captcha = False
-                            try:
-                                final_captcha = page.locator(".geetest_table_box").is_visible(timeout=1000)
-                            except:
-                                pass
-                            logger.log_debug(f"最终状态检查 - 已签到: {final_signed is not None}, 验证码可见: {final_captcha}")
             else:
                 current_url_final = page.url
                 error_msg = "未找到签到按钮"
@@ -1363,20 +1869,147 @@ def main():
                     except:
                         pass
 
+        # 最终成功状态检查（包含“今日已签到”和“签到完成”）
+        success_loc = find_signed_text_locator(page)
+        final_completed = sign_success or (success_loc is not None) or is_checkin_completed(page, logger)
+
+        # 最终失败前刷新一次页面再复核，避免状态延迟
+        if not final_completed:
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(1200)
+                success_loc = find_signed_text_locator(page)
+                final_completed = sign_success or (success_loc is not None) or is_checkin_completed(page, logger)
+                if logger:
+                    logger.log_debug(f"最终刷新复核结果: final_completed={final_completed}")
+            except Exception as e:
+                if logger:
+                    logger.log_debug(f"最终刷新复核失败: {e}")
+
+        final_sign_button_visible = is_sign_button_visible(page, timeout=1200)
+        final_success = (was_already_signed or final_completed) and (not final_sign_button_visible)
+
+        if not final_success and final_sign_button_visible:
+            failure_reason = "最终校验失败：签到按钮仍可见（判定为未签到）"
+            print(f"[ERROR] {failure_reason}")
+            if logger:
+                logger.log_error(failure_reason)
+        elif not final_success and pending_failure_reason:
+            failure_reason = pending_failure_reason
+            print(f"[ERROR] {failure_reason}")
+            if logger:
+                logger.log_sign_failed(failure_reason)
+        elif final_success:
+            failure_reason = ""
+        if final_success:
+            newly_signed_success = not was_already_signed
+            parsed_after_traffic_bytes = get_remaining_traffic_bytes(page, logger)
+
+            # 已签到场景：奖励固定为0
+            if was_already_signed and reward_traffic_bytes is None:
+                reward_traffic_bytes = 0
+
+            # 新签到成功场景：优先重试获取奖励文案，并尝试等待/刷新后获取最新剩余流量
+            if newly_signed_success and reward_traffic_bytes is None:
+                for _ in range(3):
+                    page.wait_for_timeout(1200)
+                    reward_traffic_bytes = get_reward_traffic_bytes_from_page(page, logger)
+                    if reward_traffic_bytes is not None:
+                        break
+
+            if newly_signed_success and before_traffic_bytes is not None:
+                # 页面可能延迟刷新，先重试几次读取剩余流量
+                for _ in range(3):
+                    if parsed_after_traffic_bytes is not None and parsed_after_traffic_bytes > before_traffic_bytes:
+                        break
+                    page.wait_for_timeout(1200)
+                    parsed_after_traffic_bytes = get_remaining_traffic_bytes(page, logger)
+
+                # 仍未更新则触发一次轻量刷新再读
+                if parsed_after_traffic_bytes is None or parsed_after_traffic_bytes <= before_traffic_bytes:
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=45000)
+                        page.wait_for_timeout(1200)
+                        parsed_after_traffic_bytes = get_remaining_traffic_bytes(page, logger)
+                    except Exception:
+                        pass
+
+            # 若没有奖励文案，但签到后流量比签到前大，则差值即本次奖励
+            if (
+                reward_traffic_bytes is None
+                and before_traffic_bytes is not None
+                and parsed_after_traffic_bytes is not None
+                and parsed_after_traffic_bytes > before_traffic_bytes
+            ):
+                reward_traffic_bytes = parsed_after_traffic_bytes - before_traffic_bytes
+
+            # 优先使用“签到前 + 本次奖励”作为签到后流量，规避页面数据刷新延迟
+            if before_traffic_bytes is not None and reward_traffic_bytes is not None:
+                after_traffic_bytes = before_traffic_bytes + reward_traffic_bytes
+                if logger:
+                    logger.log_debug(
+                        f"签到后流量使用计算值: {format_traffic(after_traffic_bytes)} "
+                        f"(签到前 {format_traffic(before_traffic_bytes)} + 奖励 {format_traffic(reward_traffic_bytes)})"
+                    )
+            else:
+                # 新签到成功但页面仍未刷新时，不要错误显示旧值
+                if (
+                    newly_signed_success
+                    and before_traffic_bytes is not None
+                    and parsed_after_traffic_bytes is not None
+                    and parsed_after_traffic_bytes <= before_traffic_bytes
+                ):
+                    if logger:
+                        logger.log_error("新签到成功后未能获取刷新后的剩余流量，签到后流量标记为未知")
+                    parsed_after_traffic_bytes = None
+                after_traffic_bytes = parsed_after_traffic_bytes
+
+            if after_traffic_bytes is not None:
+                print(f"[INFO] 签到后剩余流量: {format_traffic(after_traffic_bytes)}")
+                if logger:
+                    logger.log_info(f"签到后剩余流量: {format_traffic(after_traffic_bytes)}")
+
+            if reward_traffic_bytes is not None:
+                print(f"[INFO] 本次签到获得流量: {format_traffic(reward_traffic_bytes)}")
+                if logger:
+                    logger.log_info(f"本次签到获得流量: {format_traffic(reward_traffic_bytes)}")
+
         # 截图存证（如果需要）
         if save_screenshot:
-            success_loc = find_signed_text_locator(page)
-            if success_loc:
+            if final_success:
                 try:
                     # 尝试截取父级区域，让截图更美观
-                    success_loc.locator(f"xpath=ancestor::*[{SIGNED_ANCESTOR_LEVELS}]").first.screenshot(path=str(SUCCESS_SCREENSHOT))
+                    if success_loc:
+                        success_loc.locator(f"xpath=ancestor::*[{SIGNED_ANCESTOR_LEVELS}]").first.screenshot(path=str(SUCCESS_SCREENSHOT), timeout=10000)
+                    else:
+                        page.screenshot(path=str(SUCCESS_SCREENSHOT), timeout=10000)
                     print(f"[INFO] 截图已保存: {SUCCESS_SCREENSHOT}")
-                except:
-                    page.screenshot(path=str(SUCCESS_SCREENSHOT))
-                    print(f"[INFO] 截图已保存: {SUCCESS_SCREENSHOT}")
+                except Exception as e:
+                    print(f"[WARNING] 截图保存失败（不影响主流程）: {e}")
+                    if logger:
+                        logger.log_error(f"截图保存失败（不影响主流程）: {e}")
+
+        # 邮件通知（成功发送成功邮件；最终失败可发送失败邮件）
+        if final_success:
+            run_success = True
+            send_success_email(
+                logger,
+                before_traffic_bytes=before_traffic_bytes,
+                reward_traffic_bytes=reward_traffic_bytes,
+                after_traffic_bytes=after_traffic_bytes,
+                account_name=username,
+            )
+        else:
+            suppress_fail_email = os.getenv("SUPPRESS_FAIL_EMAIL", "false").strip().lower() in ("1", "true", "yes", "on")
+            if not suppress_fail_email:
+                send_failure_email(failure_reason, logger=logger, account_name=username)
+
+        update_failure_alert_state(run_success, failure_reason, logger)
         
         print("[INFO] 脚本运行结束。")
         browser.close()
 
+        return 0 if run_success else 1
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

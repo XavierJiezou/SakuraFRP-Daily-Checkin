@@ -8,6 +8,10 @@
 - 成功/失败邮件通知
 - 本地运行 + GitHub Actions 每日定时运行
 
+原始项目参考链接：
+
+- https://github.com/RyanStarFox/SakuraFRP_Auto_AI_check
+
 ## 1. 功能概览
 
 当前版本重点在稳定性：

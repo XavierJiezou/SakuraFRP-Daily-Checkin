@@ -1,5 +1,15 @@
 # SakuraFRP Auto Check-in
 
+话不多说，直接上图：
+
+<img width="585" height="1269" alt="稳定签到成功截图" src="https://github.com/user-attachments/assets/34c9ce9a-95ad-49c5-81be-1aadfe69b91c" />
+
+<img width="610" height="1315" alt="多轮失败自动重试" src="https://github.com/user-attachments/assets/e543e7f3-524a-466c-bdcf-6c7ffe9f713c" />
+
+<img width="614" height="1324" alt="邮件通知内容展示" src="https://github.com/user-attachments/assets/7d6f766a-cfe0-497c-8a6d-ccd1ea0f4623" />
+
+---
+
 稳定版 SakuraFRP 自动签到脚本，支持：
 
 - Playwright 自动化登录与签到

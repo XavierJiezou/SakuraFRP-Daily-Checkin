@@ -2,11 +2,18 @@
 
 话不多说，直接上图：
 
-<img width="585" height="1269" alt="稳定签到成功截图" src="https://github.com/user-attachments/assets/34c9ce9a-95ad-49c5-81be-1aadfe69b91c" />
-
-<img width="610" height="1315" alt="多轮失败自动重试" src="https://github.com/user-attachments/assets/e543e7f3-524a-466c-bdcf-6c7ffe9f713c" />
-
-<img width="614" height="1324" alt="邮件通知内容展示" src="https://github.com/user-attachments/assets/7d6f766a-cfe0-497c-8a6d-ccd1ea0f4623" />
+<table>
+  <tr>
+    <td><img width="100%" alt="签到成功页面（显示今日已签到）" src="https://github.com/user-attachments/assets/34c9ce9a-95ad-49c5-81be-1aadfe69b91c" /></td>
+    <td><img width="100%" alt="验证码失败后自动重试过程展示" src="https://github.com/user-attachments/assets/e543e7f3-524a-466c-bdcf-6c7ffe9f713c" /></td>
+    <td><img width="100%" alt="签到结果邮件通知示例内容" src="https://github.com/user-attachments/assets/7d6f766a-cfe0-497c-8a6d-ccd1ea0f4623" /></td>
+  </tr>
+  <tr>
+    <td align="center">签到成功页面（显示今日已签到）</td>
+    <td align="center">验证码失败后自动重试过程展示</td>
+    <td align="center">签到结果邮件通知示例内容</td>
+  </tr>
+</table>
 
 ---
 

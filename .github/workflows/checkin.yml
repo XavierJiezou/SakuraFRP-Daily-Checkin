@@ -2,8 +2,9 @@ name: SakuraFRP Daily Check-in
 
 on:
   schedule:
-    # 12:00 Asia/Shanghai == 04:00 UTC
-    - cron: '0 4 * * *'
+    # 12:07 Asia/Shanghai == 04:07 UTC
+    # 避开整点可显著降低 GitHub schedule 延迟/丢触发概率
+    - cron: '7 4 * * *'
   workflow_dispatch:
 
 concurrency:

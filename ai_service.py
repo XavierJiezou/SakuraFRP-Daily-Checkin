@@ -16,6 +16,23 @@ _TARGET_PREFIX_PATTERN = re.compile(
 )
 _TARGET_QUANTIFIER_PATTERN = re.compile(r'^(一个|一只|一张|一把|一条|一台|一辆|一双|一部|一副)')
 
+# 触发切换备用模型的错误特征：429（限流）、1305（模型繁忙）等
+_BUSY_ERROR_KEYWORDS = ("429", "1305", "rate limit", "too many requests", "overload", "繁忙", "限流")
+
+
+def is_model_busy_error(err):
+    """判断异常是否为限流/模型繁忙类错误（这类错误重试主模型没用，换模型更快）"""
+    parts = [str(err)]
+    for attr in ("status_code", "code"):
+        value = getattr(err, attr, None)
+        if value is not None:
+            parts.append(str(value))
+    body = getattr(err, "body", None)
+    if isinstance(body, dict):
+        parts.append(json.dumps(body, ensure_ascii=False))
+    text = " ".join(parts).lower()
+    return any(keyword in text for keyword in _BUSY_ERROR_KEYWORDS)
+
 
 def clean_target_name(text):
     """把模型返回的题目文本收敛成一个干净的物体名称"""
@@ -41,6 +58,8 @@ class AIService:
         """初始化AI服务，从环境变量读取配置"""
         self.api_key = os.getenv("ZHIPU_API_KEY", "")
         self.model_vision = os.getenv("ZHIPU_MODEL_VISION", "glm-4.6v-flash")
+        # 视觉备用模型：主模型限流/繁忙（429、1305）时自动切换
+        self.model_vision_fallback = os.getenv("ZHIPU_MODEL_VISION_FALLBACK", "glm-4v-flash")
         self.model_text = os.getenv("ZHIPU_MODEL_TEXT", "glm-4.7-flash")
 
         try:
@@ -59,18 +78,34 @@ class AIService:
         self.client = ZhipuAI(api_key=self.api_key)
 
     # ---------------- 基础调用 ----------------
-    def _chat(self, model, messages):
-        """带重试的对话调用，返回纯文本；失败返回空串"""
+    def _chat(self, model, messages, fallback_model=None):
+        """带重试的对话调用，返回纯文本；失败返回空串。
+
+        主模型遇到限流/模型繁忙（429、1305 等）时不再空转重试，立即切备用模型；
+        其它错误在主模型重试耗尽后也会兜底切到备用模型。
+        """
+        models = [model]
+        if fallback_model and fallback_model != model:
+            models.append(fallback_model)
+
         last_error = None
-        for i in range(self.max_retries + 1):
-            try:
-                response = self.client.chat.completions.create(model=model, messages=messages)
-                return (response.choices[0].message.content or "").strip()
-            except Exception as e:
-                last_error = e
-                print(f"[WARNING] AI 调用失败 {i + 1}/{self.max_retries + 1} ({model}): {e}")
-                if i < self.max_retries:
-                    time.sleep(1.5 * (i + 1))
+        for index, current_model in enumerate(models):
+            has_fallback = index + 1 < len(models)
+            for i in range(self.max_retries + 1):
+                try:
+                    response = self.client.chat.completions.create(model=current_model, messages=messages)
+                    if index > 0:
+                        print(f"[INFO] 备用模型 {current_model} 调用成功")
+                    return (response.choices[0].message.content or "").strip()
+                except Exception as e:
+                    last_error = e
+                    print(f"[WARNING] AI 调用失败 {i + 1}/{self.max_retries + 1} "
+                          f"({current_model}): {e}")
+                    if has_fallback and is_model_busy_error(e):
+                        print(f"[WARNING] {current_model} 限流/模型繁忙，切换备用模型: {models[index + 1]}")
+                        break
+                    if i < self.max_retries:
+                        time.sleep(1.5 * (i + 1))
 
         print(f"[ERROR] AI API 调用失败 ({model}): {last_error}")
         return ""
@@ -99,7 +134,11 @@ class AIService:
             b64 = base64.b64encode(img).decode('utf-8')
             content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
 
-        return self._chat(self.model_vision, [{"role": "user", "content": content}])
+        return self._chat(
+            self.model_vision,
+            [{"role": "user", "content": content}],
+            fallback_model=self.model_vision_fallback,
+        )
 
     # ---------------- 九宫格识别 ----------------
     def recognize_tip_object(self, tip_img_bytes):

@@ -45,6 +45,7 @@ jobs:
           cat > .env <<EOF
           ZHIPU_API_KEY=${{ secrets.ZHIPU_API_KEY }}
           ZHIPU_MODEL_VISION=glm-4.6v-flash
+          ZHIPU_MODEL_VISION_FALLBACK=glm-4v-flash
           ZHIPU_MODEL_TEXT=glm-4.7-flash
           SCHEDULE_TIME=12:00
           HTTP_PROXY=${{ secrets.HTTP_PROXY }}

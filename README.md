@@ -93,6 +93,7 @@ python main.py --both
 
 - `ZHIPU_API_KEY`: 智谱 API Key
 - `ZHIPU_MODEL_VISION`: 视觉模型（默认 `glm-4.6v-flash`）
+- `ZHIPU_MODEL_VISION_FALLBACK`: 视觉备用模型（默认 `glm-4v-flash`，主模型返回 429/1305 时自动切换）
 - `ZHIPU_MODEL_TEXT`: 文本模型（默认 `glm-4.7-flash`）
 - `AI_CALL_MAX_RETRIES`: AI 调用失败重试次数
 - `AI_CELL_WORKERS`: 九宫格逐格识别并发数（建议 2-4）
